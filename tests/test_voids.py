@@ -402,3 +402,105 @@ def test_failed_conflict_request_is_not_stored_and_retryable(client):
     assert r.status_code == 200
     assert r.json()["voided_seqs"] == [2]
     assert r.json()["committed_seqs"] == [3]
+
+
+def test_huge_void_skips_range_without_expanding_and_previews_100(client):
+    # 先提交 seq=1，再缓冲 seq=100000000：作废 2..99999999 不得逐号查库、
+    # 不得生成近亿项响应；排水按区间整体跳过，只真实提交缓冲包。
+    d = "v-s"
+    assert client.post(
+        "/api/v1/packages", json=pkg(d, 1, f"{d}-1")
+    ).status_code == 200
+    assert client.post(
+        "/api/v1/packages", json=pkg(d, 100_000_000, f"{d}-big", value=42.0)
+    ).json()["status"] == "buffered"
+
+    body = void_body(d, 2, 99_999_999, "huge")
+    r = client.post(f"/api/v1/devices/{d}/voids", json=body)
+    assert r.status_code == 200, r.text
+    first = r.json()
+    assert first["voided_count"] == 99_999_998
+    assert first["voided_seqs_truncated"] is True
+    assert len(first["voided_seqs"]) == 100
+    assert first["voided_seqs"] == list(range(2, 102))
+    # 只对真实缓冲包排水提交并评估告警，committed_upto 直达缓冲边界
+    assert first["committed_seqs"] == [100_000_000]
+    assert first["committed_upto"] == 100_000_000
+
+    # 查询作废记录同样不展开整段：总数按区间聚合，每段只列前 100 项
+    got = client.get(f"/api/v1/devices/{d}/voids").json()
+    assert got["count"] == 1
+    assert got["voided_count"] == 99_999_998
+    rec = got["records"][0]
+    assert rec["voided_count"] == 99_999_998
+    assert rec["voided_seqs_truncated"] is True
+    assert rec["voided_seqs"] == list(range(2, 102))
+
+    # committed 只有真实包 1 与 100000000
+    seqs = client.get(
+        f"/api/v1/devices/{d}/committed",
+        params={"limit": 10, "offset": 0},
+    ).json()
+    assert seqs["count"] == 2 and seqs["seqs"] == [1, 100_000_000]
+
+    # 同键重放：原样返回首次结果（含截断标志与前缀），不重复登记/排水
+    replay = client.post(f"/api/v1/devices/{d}/voids", json=body)
+    assert replay.status_code == 200
+    assert replay.json() == first
+    assert client.get(f"/api/v1/devices/{d}/voids").json()["count"] == 1
+    assert client.get(f"/api/v1/devices/{d}/committed").json()["count"] == 2
+
+    # 作废段内迟到的原包仍判重复，不会复活
+    late = client.post(
+        "/api/v1/packages", json=pkg(d, 50_000_000, f"{d}-late")
+    ).json()
+    assert late["status"] == "duplicate"
+    assert late["duplicate_reason"] == "already_voided"
+
+    # 同键不同载荷仍 409
+    conflict = client.post(
+        f"/api/v1/devices/{d}/voids", json=void_body(d, 2, 99_999_998, "huge")
+    )
+    assert conflict.status_code == 409
+
+    # 缓冲已清空：继续作废无缓冲支撑 -> 409（事务原子性，状态未被破坏）
+    assert client.post(
+        f"/api/v1/devices/{d}/voids",
+        json=void_body(d, 100_000_001, 100_000_001, "after"),
+    ).status_code == 409
+
+
+def test_small_void_segments_return_full_seqs_without_truncation(client):
+    d = "v-t"
+    client.post("/api/v1/packages", json=pkg(d, 1, f"{d}-1"))
+    client.post("/api/v1/packages", json=pkg(d, 101, f"{d}-101"))
+    # 恰好 100 项的段 [2,101]（段尾恰为缓冲最大序号）：完整返回、不截断
+    r = client.post(
+        f"/api/v1/devices/{d}/voids", json=void_body(d, 2, 101, "exact100")
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["voided_count"] == 100
+    assert body["voided_seqs_truncated"] is False
+    assert body["voided_seqs"] == list(range(2, 102))
+    assert body["committed_seqs"] == [101]
+
+    # 另一段 101 项：截断，只列前 100
+    d2 = "v-t2"
+    client.post("/api/v1/packages", json=pkg(d2, 1, f"{d2}-1"))
+    client.post("/api/v1/packages", json=pkg(d2, 102, f"{d2}-102"))
+    r = client.post(
+        f"/api/v1/devices/{d2}/voids", json=void_body(d2, 2, 102, "over100")
+    )
+    body = r.json()
+    assert body["voided_count"] == 101
+    assert body["voided_seqs_truncated"] is True
+    assert body["voided_seqs"] == list(range(2, 102))
+    assert body["committed_seqs"] == [102]
+
+    got = client.get(f"/api/v1/devices/{d2}/voids").json()
+    rec = got["records"][0]
+    assert rec["voided_count"] == 101
+    assert rec["voided_seqs_truncated"] is True
+    assert rec["voided_seqs"] == list(range(2, 102))
+

@@ -82,6 +82,7 @@ from .voids import (
     list_void_records,
     void_missing,
     voided_count,
+    voided_seqs_preview,
 )
 from .warmup import WarmupError, evaluate_warmup_release
 
@@ -316,7 +317,11 @@ def get_voids(
     records = []
     for r in rows:
         d = dict(r)
-        d["voided_seqs"] = list(range(r["from_seq"], r["to_seq"] + 1))
+        # 按区间直接取序号总数与前缀预览，不展开大跨度作废段
+        count, seqs, truncated = voided_seqs_preview(r["from_seq"], r["to_seq"])
+        d["voided_count"] = count
+        d["voided_seqs"] = seqs
+        d["voided_seqs_truncated"] = truncated
         records.append(VoidRecordOut(**d))
     return VoidsResponse(
         device_id=device_id,

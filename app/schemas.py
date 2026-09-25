@@ -109,12 +109,24 @@ class VoidCreate(BaseModel):
         return self
 
 
+# 作废序号预览上限：大跨度作废段（可达近亿序号）不展开全集，
+# voided_seqs 只列段内前 VOIDED_SEQ_PREVIEW_LIMIT 项，并以截断标志说明。
+VOIDED_SEQ_PREVIEW_LIMIT = 100
+
+
 class VoidResponse(BaseModel):
     status: Literal["voided"]
     device_id: str
     from_seq: int = Field(description="作废段起点（含）")
     to_seq: int = Field(description="作废段终点（含）")
-    voided_seqs: List[int] = Field(description="本次登记作废的全部序号")
+    voided_count: int = Field(description="本次作废的序号总数（= 区间长度，与跨度无关地直接计算）")
+    voided_seqs: List[int] = Field(
+        description=f"本次作废序号预览：最多前 {VOIDED_SEQ_PREVIEW_LIMIT} 项；"
+        "小段（不超过上限）返回完整序号"
+    )
+    voided_seqs_truncated: bool = Field(
+        description="voided_seqs 是否被截断：true 表示段长超过预览上限、仅列出前缀"
+    )
     committed_upto: int = Field(
         description="作废并排水后已连续处理（提交或作废）的最大序号"
     )
@@ -131,7 +143,14 @@ class VoidRecordOut(BaseModel):
     device_id: str
     from_seq: int = Field(description="作废段起点（含）")
     to_seq: int = Field(description="作废段终点（含）")
-    voided_seqs: List[int] = Field(description="该段作废的全部序号")
+    voided_count: int = Field(description="该段作废序号总数（= to_seq - from_seq + 1）")
+    voided_seqs: List[int] = Field(
+        description=f"作废序号预览：最多前 {VOIDED_SEQ_PREVIEW_LIMIT} 项；"
+        "小段（不超过上限）返回完整序号"
+    )
+    voided_seqs_truncated: bool = Field(
+        description="voided_seqs 是否被截断：true 表示段长超过预览上限、仅列出前缀"
+    )
     created_at: str
 
 
@@ -142,7 +161,9 @@ class VoidsResponse(BaseModel):
     )
     next_expected: int
     count: int = Field(description="作废登记段数")
-    voided_count: int = Field(description="已作废序号总数")
+    voided_count: int = Field(
+        description="已作废序号总数（各作废段长度之和，按区间直接聚合）"
+    )
     records: List[VoidRecordOut]
 
 

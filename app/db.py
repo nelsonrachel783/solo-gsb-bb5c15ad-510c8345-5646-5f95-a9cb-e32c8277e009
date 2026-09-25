@@ -162,6 +162,11 @@ CREATE TABLE IF NOT EXISTS void_records (
 
 CREATE INDEX IF NOT EXISTS idx_void_records_device ON void_records (device_id, id);
 
+-- 作废覆盖 / 重叠查询按 (设备, from_seq) 走索引：排水判断某序号是否被
+-- 已登记作废段覆盖时只做索引点查，即使作废段跨度近亿也不逐号扫描。
+CREATE INDEX IF NOT EXISTS idx_void_records_device_from
+    ON void_records (device_id, from_seq);
+
 -- 作废请求的幂等键：与摄入幂等表结构对应但独立存放，重放不产生重复登记。
 CREATE TABLE IF NOT EXISTS void_idempotency_keys (
     key           TEXT PRIMARY KEY,

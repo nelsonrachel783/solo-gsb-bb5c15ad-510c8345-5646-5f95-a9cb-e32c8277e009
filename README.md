@@ -4,7 +4,7 @@
 
 - **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据或重复告警事件；
 - **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**（告警也按该提交顺序评估）；
-- **缺包作废**：确定丢失的连续序号段可登记作废以推进顺序前沿（段必须从 `next_expected` 开始、段内确为缺口、段尾不超过缓冲区最大序号），作废后立即排水提交随后连续的缓冲包；作废序号**不是测量包**，不进入已提交数据、不参与告警；
+- **缺包作废**：确定丢失的连续序号段可登记作废以推进顺序前沿（段必须从 `next_expected` 开始、段内确为缺口、段尾不超过缓冲区最大序号），作废后立即排水提交随后连续的缓冲包；排水按**已登记区间整段跳过**作废序号（不逐号查库，支持跨度近亿的大段作废），作废序号**不是测量包**，不进入已提交数据、不参与告警；作废响应与记录只返回区间总数与序号前缀预览（最多前 100 项并标明是否截断），不展开整段；
 - **可观测接口**：查询每台设备的缺口（按连续缺口区间分页）、已提交序号、重复包记录与作废登记；
 - **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
@@ -295,8 +295,12 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature
 作废处理（同一事务内）：
 
 1. 在 `void_records` 登记作废段（只登记"缺席"事实，**不构造任何测量包**）；
-2. 推进顺序前沿并立即排水：作废序号被跨过，其后连续的缓冲包按序提交到
-   `committed`，`committed_upto` 更新为"提交 / 作废"连续覆盖到的最大序号；
+2. 推进顺序前沿并立即排水：排水按已登记区间**整段跳过**作废序号（按索引
+   一次跳到段尾，不逐号查库），其后连续的缓冲包按序提交到 `committed`，
+   `committed_upto` 更新为"提交 / 作废"连续覆盖到的最大序号。即使作废
+   跨度近亿（例如先提交 `seq=1`、再缓冲 `seq=100000000`，作废
+   `2..99999999`），耗时也只与真实提交的缓冲包数、跨过的作废段数有关，
+   与作废跨度无关，不会长时间占锁或耗尽内存；
 3. 排水沿用现有告警评估：只有真实提交的缓冲包进入告警状态机，
    **作废序号绝不被伪装成测量包**，不产生任何告警事件。
 
@@ -319,11 +323,17 @@ curl -X POST localhost:8000/api/v1/devices/ph-meter-01/voids \
   -d '{"from_seq": 2, "to_seq": 3, "idempotency_key": "void-ph-meter-01-2-3"}'
 # => 200
 # {"status":"voided","device_id":"ph-meter-01","from_seq":2,"to_seq":3,
-#  "voided_seqs":[2,3],"committed_upto":5,"committed_seqs":[4,5]}
+#  "voided_count":2,"voided_seqs":[2,3],"voided_seqs_truncated":false,
+#  "committed_upto":5,"committed_seqs":[4,5]}
 ```
 
+- `voided_count`：本次作废的序号总数（按区间长度直接计算，与跨度无关）；
+- `voided_seqs`：作废序号**预览**，最多列出段内**前 100 项**；
+  `voided_seqs_truncated=false` 表示段不超过 100 项、列出的是完整序号；
+  大跨度段（超过 100 项）只返回前缀并置 `voided_seqs_truncated=true`，
+  响应不展开整段，避免近亿元素撑爆内存；
 - `committed_seqs`：作废后**立即排水提交的真实缓冲包**（不含作废序号）；
-- 同一作废请求（同幂等键同载荷）重试：原样返回首次结果，**不重复登记、
+- 同一作废请求（同幂等键同载荷）重试：原样返回首次结果（含预览与截断标志），**不重复登记、
   不重复推进、不重复排水**；
 - 同幂等键携带不同载荷，或请求与当前状态冲突（起点不是 `next_expected`、
   段内含缓冲包、段尾越过缓冲边界等）→ `409 Conflict`，`detail` 给出具体原因；
@@ -339,8 +349,14 @@ curl localhost:8000/api/v1/devices/ph-meter-01/voids
 # => {"device_id":"ph-meter-01","committed_upto":5,"next_expected":6,
 #     "count":1,"voided_count":2,
 #     "records":[{"id":1,"device_id":"ph-meter-01","from_seq":2,"to_seq":3,
-#                 "voided_seqs":[2,3],"created_at":"..."}]}
+#                 "voided_count":2,"voided_seqs":[2,3],
+#                 "voided_seqs_truncated":false,"created_at":"..."}]}
 ```
+
+每段记录的 `voided_count` 为该段序号总数；`voided_seqs` 为序号预览
+（最多前 100 项），`voided_seqs_truncated=true` 表示段长超过 100、
+仅列出前缀——查询同样不展开大跨度作废段。顶层 `voided_count` 为各段
+长度之和（SQL 按区间聚合，不逐号展开）。
 
 `GET /api/v1/devices` 的每个设备状态另含 `voided_count`（已作废序号总数）。
 
@@ -581,7 +597,8 @@ curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 curl -X POST localhost:8000/api/v1/devices/ph-meter-01/voids \
   -H 'Content-Type: application/json' \
   -d '{"from_seq":2,"to_seq":3,"idempotency_key":"void-0012"}'
-# => {"status":"voided","voided_seqs":[2,3],"committed_upto":4,"committed_seqs":[4]}
+# => {"status":"voided","voided_count":2,"voided_seqs":[2,3],
+#     "voided_seqs_truncated":false,"committed_upto":4,"committed_seqs":[4]}
 
 # committed 只有真实包：1、4（作废序号 2、3 永久缺席）
 curl localhost:8000/api/v1/devices/ph-meter-01/committed

@@ -12,6 +12,11 @@
   登记作废段，再通过与摄入相同的排水路径推进顺序前沿，随后连续的
   缓冲包立即按序提交；排水时沿用现有告警评估——作废序号不是测量包，
   绝不伪装成测量数据参与状态机；
+- 排水按已登记区间**整段跳过**作废序号，不逐号查库；作废段可达近亿
+  序号（先提交 seq=1、再缓冲 seq=100000000），逐号遍历会长时间占锁
+  甚至耗尽内存。响应只按区间长度给出作废总数与序号前缀预览
+  （voided_seqs 最多前 100 项，截断时置 voided_seqs_truncated=true），
+  查询作废记录同样不展开整段；
 - 同一作废请求按幂等键重试：返回首次结果，不重复登记、不重复推进；
   幂等键被不同载荷使用、或请求与当前设备状态冲突（起点不是
   next_expected、越过缓冲边界、段内含缓冲包等）返回 409。
@@ -27,7 +32,7 @@ from typing import Optional
 
 from . import alerts
 from .logic import drain_committed
-from .schemas import VoidResponse
+from .schemas import VOIDED_SEQ_PREVIEW_LIMIT, VoidResponse
 
 
 class VoidError(ValueError):
@@ -36,6 +41,19 @@ class VoidError(ValueError):
 
 class VoidConflict(Exception):
     """作废请求与幂等记录或当前设备状态冲突。"""
+
+
+def voided_seqs_preview(from_seq: int, to_seq: int) -> tuple:
+    """作废序号预览：不展开整段，只取段内前 VOIDED_SEQ_PREVIEW_LIMIT 项。
+
+    返回 (voided_count, voided_seqs, truncated)。段长不超过预览上限时
+    返回完整序号、truncated=False；大跨度段（例如 2..99999999）只返回
+    前缀与截断标志，总数由区间长度直接算出，不构造近亿元素的列表。
+    """
+    count = to_seq - from_seq + 1
+    truncated = count > VOIDED_SEQ_PREVIEW_LIMIT
+    preview_end = min(to_seq, from_seq + VOIDED_SEQ_PREVIEW_LIMIT - 1)
+    return count, list(range(from_seq, preview_end + 1)), truncated
 
 
 def _canonical_request(device_id: str, from_seq: int, to_seq: int) -> str:
@@ -140,12 +158,15 @@ def void_missing(
     )
     alerts.evaluate_drain(conn, device_id, committed_payloads)
 
+    voided_total, seqs_preview, truncated = voided_seqs_preview(from_seq, to_seq)
     response = VoidResponse(
         status="voided",
         device_id=device_id,
         from_seq=from_seq,
         to_seq=to_seq,
-        voided_seqs=list(range(from_seq, to_seq + 1)),
+        voided_count=voided_total,
+        voided_seqs=seqs_preview,
+        voided_seqs_truncated=truncated,
         committed_upto=new_upto,
         committed_seqs=[s for s, _ in committed_payloads],
     )
