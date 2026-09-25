@@ -80,6 +80,7 @@ from .voids import (
     VoidConflict,
     VoidError,
     list_void_records,
+    segment_listing,
     void_missing,
     voided_count,
 )
@@ -315,8 +316,14 @@ def get_voids(
         upto = dev["committed_upto"]
     records = []
     for r in rows:
+        # 大跨度作废段只按区间返回总数与前 100 个序号，不展开全集
+        seg_total, seg_seqs, seg_truncated = segment_listing(
+            r["from_seq"], r["to_seq"]
+        )
         d = dict(r)
-        d["voided_seqs"] = list(range(r["from_seq"], r["to_seq"] + 1))
+        d["voided_count"] = seg_total
+        d["voided_seqs"] = seg_seqs
+        d["voided_seqs_truncated"] = seg_truncated
         records.append(VoidRecordOut(**d))
     return VoidsResponse(
         device_id=device_id,

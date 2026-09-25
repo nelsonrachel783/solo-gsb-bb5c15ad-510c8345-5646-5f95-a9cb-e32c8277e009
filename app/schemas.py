@@ -114,7 +114,15 @@ class VoidResponse(BaseModel):
     device_id: str
     from_seq: int = Field(description="作废段起点（含）")
     to_seq: int = Field(description="作废段终点（含）")
-    voided_seqs: List[int] = Field(description="本次登记作废的全部序号")
+    voided_count: int = Field(
+        description="本次作废序号总数（区间长度 = to_seq - from_seq + 1）"
+    )
+    voided_seqs: List[int] = Field(
+        description="本次作废序号（升序），最多列出前 100 项；小段为完整列表"
+    )
+    voided_seqs_truncated: bool = Field(
+        description="voided_seqs 是否被截断：段长超过 100 时仅列前 100 项"
+    )
     committed_upto: int = Field(
         description="作废并排水后已连续处理（提交或作废）的最大序号"
     )
@@ -131,7 +139,15 @@ class VoidRecordOut(BaseModel):
     device_id: str
     from_seq: int = Field(description="作废段起点（含）")
     to_seq: int = Field(description="作废段终点（含）")
-    voided_seqs: List[int] = Field(description="该段作废的全部序号")
+    voided_count: int = Field(
+        description="该段作废序号总数（区间长度 = to_seq - from_seq + 1）"
+    )
+    voided_seqs: List[int] = Field(
+        description="该段作废序号（升序），最多列出前 100 项；小段为完整列表"
+    )
+    voided_seqs_truncated: bool = Field(
+        description="voided_seqs 是否被截断：段长超过 100 时仅列前 100 项"
+    )
     created_at: str
 
 

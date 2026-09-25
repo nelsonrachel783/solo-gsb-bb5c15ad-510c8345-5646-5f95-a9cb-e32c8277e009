@@ -4,7 +4,7 @@
 
 - **幂等去重**：每个包携带幂等键，重试 / 重发不会产生重复数据或重复告警事件；
 - **乱序缓冲**：序号不连续的包先暂存，缺口补齐后**按序连续提交**（告警也按该提交顺序评估）；
-- **缺包作废**：确定丢失的连续序号段可登记作废以推进顺序前沿（段必须从 `next_expected` 开始、段内确为缺口、段尾不超过缓冲区最大序号），作废后立即排水提交随后连续的缓冲包；作废序号**不是测量包**，不进入已提交数据、不参与告警；
+- **缺包作废**：确定丢失的连续序号段可登记作废以推进顺序前沿（段必须从 `next_expected` 开始、段内确为缺口、段尾不超过缓冲区最大序号），作废后立即排水提交随后连续的缓冲包；作废序号**不是测量包**，不进入已提交数据、不参与告警；大跨度作废段（如 `2..99999999`）按已登记区间**整段跨过**，不逐号查库，响应与登记记录按区间返回序号总数、序号列表最多列前 100 项并标记截断；
 - **可观测接口**：查询每台设备的缺口（按连续缺口区间分页）、已提交序号、重复包记录与作废登记；
 - **窗口聚合**：按事件时间（`sent_at`）把已提交测量分入半开窗口，输出 count / min / max / mean，并以水位机制隔离迟到样本；
 - **持久化阈值告警**：按设备 + 指标配置上限 / 下限与连续触发、恢复次数，带连续计数的迟滞状态机防抖动，规则状态与告警 / 恢复事件持久化在 SQLite。
@@ -91,8 +91,8 @@ pytest tests/
 | GET | `/api/v1/devices/{id}/gaps` | 缺口：缓冲序号与缺失序号分页（`limit`/`offset`，按连续缺口区间计算，含 `gap_count`） |
 | GET | `/api/v1/devices/{id}/committed` | 已提交序号（支持 `from_seq`/`to_seq`/`limit`/`offset`；作废序号不在其中） |
 | GET | `/api/v1/devices/{id}/duplicates` | 重复包记录（可按 `reason` 过滤，含 `already_voided`） |
-| POST | `/api/v1/devices/{id}/voids` | 登记缺包作废段（幂等；推进前沿并立即排水提交后续缓冲包） |
-| GET | `/api/v1/devices/{id}/voids` | 按设备分页查询作废登记 |
+| POST | `/api/v1/devices/{id}/voids` | 登记缺包作废段（幂等；推进前沿并立即排水提交后续缓冲包；大跨度段按区间处理，序号列表最多前 100 项） |
+| GET | `/api/v1/devices/{id}/voids` | 按设备分页查询作废登记（每段返回区间总数与前 100 个序号，标记是否截断） |
 | GET | `/api/v1/devices/{id}/metrics/rollup` | 按事件时间的窗口聚合（count/min/max/mean + 水位迟到统计，可选 `calibrated=true` 校准值口径） |
 | GET | `/api/v1/devices/{id}/metrics/warmup-release` | 仪器预热稳定放行：在已提交读数中寻找最早完成的连续稳定段（只读） |
 | GET | `/api/v1/devices/{id}/metrics/exposure` | 超阈暴露量积分：线性插值后对 `max(value-threshold,0)` 在 `[from,to)` 积分（只读） |
@@ -295,12 +295,19 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/alerts/events?metric=temperature
 作废处理（同一事务内）：
 
 1. 在 `void_records` 登记作废段（只登记"缺席"事实，**不构造任何测量包**）；
-2. 推进顺序前沿并立即排水：作废序号被跨过，其后连续的缓冲包按序提交到
-   `committed`，`committed_upto` 更新为"提交 / 作废"连续覆盖到的最大序号；
+2. 推进顺序前沿并立即排水：作废段按已登记区间**整段跨过**（不逐号查库），
+   其后连续的缓冲包按序提交到 `committed`，`committed_upto` 更新为
+   "提交 / 作废"连续覆盖到的最大序号；
 3. 排水沿用现有告警评估：只有真实提交的缓冲包进入告警状态机，
    **作废序号绝不被伪装成测量包**，不产生任何告警事件。
 
 作废之后迟到的原包按重复处理（`already_voided`），不会复活、不会写入 committed。
+
+> 大跨度作废段同样高效：设备先提交 `seq=1`、再缓冲 `seq=100000000` 时，
+> 作废 `2..99999999`（近一亿个序号）只做常数次区间查询与一次真实包提交，
+> 不会逐号展开、不会长时间占锁或耗尽内存；响应与作废记录中的
+> `voided_seqs` 最多列出每段**前 100 个**序号并以 `voided_seqs_truncated`
+> 标记是否截断，区间序号总数由 `voided_count` 给出（小段仍返回完整列表）。
 
 ### 登记作废
 
@@ -319,9 +326,13 @@ curl -X POST localhost:8000/api/v1/devices/ph-meter-01/voids \
   -d '{"from_seq": 2, "to_seq": 3, "idempotency_key": "void-ph-meter-01-2-3"}'
 # => 200
 # {"status":"voided","device_id":"ph-meter-01","from_seq":2,"to_seq":3,
-#  "voided_seqs":[2,3],"committed_upto":5,"committed_seqs":[4,5]}
+#  "voided_count":2,"voided_seqs":[2,3],"voided_seqs_truncated":false,
+#  "committed_upto":5,"committed_seqs":[4,5]}
 ```
 
+- `voided_count`：本次作废序号**总数**（区间长度 `to_seq - from_seq + 1`，按整数算术给出）；
+- `voided_seqs`：本次作废序号（升序），**最多列出前 100 项**；段长超过 100 时
+  `voided_seqs_truncated=true`，小段为完整列表；
 - `committed_seqs`：作废后**立即排水提交的真实缓冲包**（不含作废序号）；
 - 同一作废请求（同幂等键同载荷）重试：原样返回首次结果，**不重复登记、
   不重复推进、不重复排水**；
@@ -339,8 +350,13 @@ curl localhost:8000/api/v1/devices/ph-meter-01/voids
 # => {"device_id":"ph-meter-01","committed_upto":5,"next_expected":6,
 #     "count":1,"voided_count":2,
 #     "records":[{"id":1,"device_id":"ph-meter-01","from_seq":2,"to_seq":3,
-#                 "voided_seqs":[2,3],"created_at":"..."}]}
+#                 "voided_count":2,"voided_seqs":[2,3],
+#                 "voided_seqs_truncated":false,"created_at":"..."}]}
 ```
+
+每条记录同样按区间返回：`voided_count` 为该段作废序号总数，`voided_seqs`
+最多列前 100 项并以 `voided_seqs_truncated` 标记截断（小段完整列出）；
+顶层 `voided_count` 是该设备全部作废段的序号总数。
 
 `GET /api/v1/devices` 的每个设备状态另含 `voided_count`（已作废序号总数）。
 
@@ -581,7 +597,8 @@ curl localhost:8000/api/v1/devices/ph-meter-01/duplicates   # 重复包记录
 curl -X POST localhost:8000/api/v1/devices/ph-meter-01/voids \
   -H 'Content-Type: application/json' \
   -d '{"from_seq":2,"to_seq":3,"idempotency_key":"void-0012"}'
-# => {"status":"voided","voided_seqs":[2,3],"committed_upto":4,"committed_seqs":[4]}
+# => {"status":"voided","voided_count":2,"voided_seqs":[2,3],
+#     "voided_seqs_truncated":false,"committed_upto":4,"committed_seqs":[4]}
 
 # committed 只有真实包：1、4（作废序号 2、3 永久缺席）
 curl localhost:8000/api/v1/devices/ph-meter-01/committed
@@ -934,9 +951,9 @@ curl 'localhost:8000/api/v1/devices/ph-meter-01/metrics/clock-drift?metric=tempe
 ```
 app/
   main.py         # FastAPI 路由
-  logic.py        # 摄入核心：幂等判定、缓冲、排水提交（摄入与作废共用的排水路径，提交时驱动告警评估）
+  logic.py        # 摄入核心：幂等判定、缓冲、排水提交（摄入与作废共用的排水路径，作废区间整段跨过，提交时驱动告警评估）
   gaps.py         # 缺口查询：连续缺口区间计算与分页（不展开缺失序号全集，深翻页算术定位）
-  voids.py        # 缺包作废：缺口段校验、登记推进、共用排水、幂等与登记查询
+  voids.py        # 缺包作废：缺口段校验、登记推进、共用排水、幂等与登记查询（大跨度段按区间返回总数，序号列表截断）
   alerts.py       # 阈值告警：规则 CRUD、带连续计数的迟滞状态机、按提交顺序评估
   calibrations.py # 设备指标校准：有效区间不重叠校验、按时刻解析与线性校准计算（含区间索引供聚合批量解析）
   rollup.py       # 窗口聚合：半开窗口分桶、水位迟到判定、可选校准值口径

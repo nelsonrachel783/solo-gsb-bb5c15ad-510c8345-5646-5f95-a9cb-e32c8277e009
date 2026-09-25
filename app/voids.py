@@ -18,6 +18,12 @@
 
 作废之后迟到的"作废序号"原包：在摄入侧被判为 already_voided
 重复（见 logic.ingest_package），不会复活，也不会写入 committed。
+
+大跨度作废段（例如先提交 seq=1、再缓冲 seq=100000000，作废
+2..99999999）：排水按已登记区间整段跨过（见 logic.drain_committed），
+不逐号查库；POST 响应与 GET 登记记录均按区间返回序号总数
+voided_count，voided_seqs 最多列前 VOIDED_SEQS_LIST_LIMIT 项并以
+voided_seqs_truncated 标记截断，小段仍返回完整序号列表。
 """
 
 import hashlib
@@ -36,6 +42,19 @@ class VoidError(ValueError):
 
 class VoidConflict(Exception):
     """作废请求与幂等记录或当前设备状态冲突。"""
+
+
+# 响应中 voided_seqs 最多展开的序号个数：大跨度作废段（可长达近亿个序号）
+# 只列前若干项并以 voided_seqs_truncated 标记截断，区间序号总数由
+# voided_count 按整数算术给出，绝不展开全集。
+VOIDED_SEQS_LIST_LIMIT = 100
+
+
+def segment_listing(from_seq: int, to_seq: int) -> tuple:
+    """作废段的响应视图：(区间序号总数, 前 VOIDED_SEQS_LIST_LIMIT 个序号, 是否截断)。"""
+    total = to_seq - from_seq + 1
+    shown = list(range(from_seq, from_seq + min(total, VOIDED_SEQS_LIST_LIMIT)))
+    return total, shown, total > VOIDED_SEQS_LIST_LIMIT
 
 
 def _canonical_request(device_id: str, from_seq: int, to_seq: int) -> str:
@@ -129,8 +148,8 @@ def void_missing(
         (device_id, from_seq, to_seq),
     )
 
-    # 4) 与摄入共用的排水：跨过作废序号，提交其后连续的缓冲包。
-    #    仅真实提交的包进入 committed_payloads，告警评估不会看到作废序号。
+    # 4) 与摄入共用的排水：作废段按区间整段跨过，只对其后连续的真实缓冲包
+    #    逐包提交并评估告警；近亿个作废序号也只花常数次查询。
     new_upto, committed_payloads = drain_committed(
         conn, device_id, committed_upto
     )
@@ -140,12 +159,15 @@ def void_missing(
     )
     alerts.evaluate_drain(conn, device_id, committed_payloads)
 
+    voided_total, voided_seqs, voided_truncated = segment_listing(from_seq, to_seq)
     response = VoidResponse(
         status="voided",
         device_id=device_id,
         from_seq=from_seq,
         to_seq=to_seq,
-        voided_seqs=list(range(from_seq, to_seq + 1)),
+        voided_count=voided_total,
+        voided_seqs=voided_seqs,
+        voided_seqs_truncated=voided_truncated,
         committed_upto=new_upto,
         committed_seqs=[s for s, _ in committed_payloads],
     )

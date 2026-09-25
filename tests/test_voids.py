@@ -402,3 +402,97 @@ def test_failed_conflict_request_is_not_stored_and_retryable(client):
     assert r.status_code == 200
     assert r.json()["voided_seqs"] == [2]
     assert r.json()["committed_seqs"] == [3]
+
+
+def test_void_huge_span_skips_range_without_expansion(client):
+    """大跨度作废：排水按作废区间整段跨过，响应与记录只列前 100 个序号。"""
+    d = "v-huge"
+    client.post(
+        "/api/v1/rules",
+        json={"device_id": d, "metric": "temperature", "upper_limit": 5},
+    )
+    # 先提交 seq=1，再缓冲 seq=100000000：缺口 2..99999999 近一亿个序号
+    client.post("/api/v1/packages", json=pkg(d, 1, f"{d}-1", value=1.0))
+    client.post("/api/v1/packages", json=pkg(d, 100000000, f"{d}-1e8", value=8.0))
+
+    r = client.post(
+        f"/api/v1/devices/{d}/voids", json=void_body(d, 2, 99999999, "huge")
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "voided"
+    assert body["voided_count"] == 99999998  # 区间总数按算术给出
+    assert body["voided_seqs"] == list(range(2, 102))  # 只列前 100 项
+    assert body["voided_seqs_truncated"] is True
+    # 排水只对真实缓冲包提交：100000000 立即提交
+    assert body["committed_seqs"] == [100000000]
+    assert body["committed_upto"] == 100000000
+
+    # 告警只对真实提交的缓冲包评估：一条 seq=100000000 的触发事件
+    events = client.get(f"/api/v1/devices/{d}/alerts/events").json()
+    assert events["count"] == 1
+    assert events["events"][0]["seq"] == 100000000
+    assert events["events"][0]["event_type"] == "triggered"
+
+    # 查询作废记录：同样按区间返回总数 + 截断列表，不展开整段
+    recs = client.get(f"/api/v1/devices/{d}/voids").json()
+    assert recs["count"] == 1
+    assert recs["voided_count"] == 99999998
+    rec = recs["records"][0]
+    assert rec["voided_count"] == 99999998
+    assert rec["voided_seqs"] == list(range(2, 102))
+    assert rec["voided_seqs_truncated"] is True
+
+    # 幂等重放：原样返回首次结果，不重复登记、不重复推进
+    retry = client.post(
+        f"/api/v1/devices/{d}/voids", json=void_body(d, 2, 99999999, "huge")
+    )
+    assert retry.status_code == 200
+    assert retry.json() == body
+    assert client.get(f"/api/v1/devices/{d}/voids").json()["count"] == 1
+
+    # 迟到的大跨度作废序号原包：判为重复 already_voided，不会复活
+    late = client.post("/api/v1/packages", json=pkg(d, 50000000, f"{d}-late"))
+    assert late.status_code == 200
+    assert late.json()["status"] == "duplicate"
+    assert late.json()["duplicate_reason"] == "already_voided"
+    # committed 只有真实包；设备汇总按区间统计作废总数
+    assert client.get(f"/api/v1/devices/{d}/committed").json()["seqs"] == [
+        1,
+        100000000,
+    ]
+    me = [x for x in client.get("/api/v1/devices").json() if x["device_id"] == d][0]
+    assert me["voided_count"] == 99999998
+    assert me["committed_count"] == 2
+
+
+def test_void_seqs_listing_boundary_at_100(client):
+    """段长恰为 100 时完整列出不截断；段长 101 时只列前 100 项并标记截断。"""
+    d = "v-edge"
+    client.post("/api/v1/packages", json=pkg(d, 1, f"{d}-1"))
+    client.post("/api/v1/packages", json=pkg(d, 102, f"{d}-102"))
+    # 段长 100：完整列出，不截断
+    r = client.post(f"/api/v1/devices/{d}/voids", json=void_body(d, 2, 101, "e100"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["voided_count"] == 100
+    assert body["voided_seqs"] == list(range(2, 102))
+    assert body["voided_seqs_truncated"] is False
+    assert body["committed_seqs"] == [102]
+
+    # 段长 101：只列前 100 项，标记截断
+    client.post("/api/v1/packages", json=pkg(d, 204, f"{d}-204"))
+    r = client.post(f"/api/v1/devices/{d}/voids", json=void_body(d, 103, 203, "e101"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["voided_count"] == 101
+    assert body["voided_seqs"] == list(range(103, 203))
+    assert body["voided_seqs_truncated"] is True
+    assert body["committed_seqs"] == [204]
+
+    # GET 记录与 POST 响应口径一致
+    recs = client.get(f"/api/v1/devices/{d}/voids").json()["records"]
+    assert [x["voided_count"] for x in recs] == [100, 101]
+    assert [x["voided_seqs_truncated"] for x in recs] == [False, True]
+    assert recs[0]["voided_seqs"] == list(range(2, 102))
+    assert recs[1]["voided_seqs"] == list(range(103, 203))
